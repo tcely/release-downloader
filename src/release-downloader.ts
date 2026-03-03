@@ -3,6 +3,7 @@ import * as fs from 'fs'
 import * as io from '@actions/io'
 import * as path from 'path'
 import * as thc from 'typed-rest-client/HttpClient'
+import * as crypto from 'crypto'
 import { minimatch } from 'minimatch'
 
 import { DownloadMetaData, GithubRelease } from './gh-api'
@@ -14,10 +15,27 @@ export class ReleaseDownloader {
   private httpClient: thc.HttpClient
 
   private apiRoot: string
+  private supportedHashes: string[]
 
   constructor(httpClient: thc.HttpClient, githubApiUrl: string) {
     this.httpClient = httpClient
     this.apiRoot = githubApiUrl
+    this.supportedHashes = crypto.getHashes()
+  }
+
+  /**
+   * Translates GitHub "algo:hash" to Node.js crypto names.
+   */
+  private parseDigest(digest: string): { algorithm: string; expectedHash: string } | undefined {
+    if (!digest || !digest.includes(':')) return undefined
+    const [ghAlgo, hash] = digest.split(':')
+    const normalizedAlgo = ghAlgo.toLowerCase().replace('-', '')
+    
+    if (!this.supportedHashes.includes(normalizedAlgo)) {
+      core.warning(`Unsupported digest algorithm '${ghAlgo}'. Skipping verification.`)
+      return undefined
+    }
+    return { algorithm: normalizedAlgo, expectedHash: hash.toLowerCase() }
   }
 
   async download(
@@ -196,6 +214,7 @@ export class ReleaseDownloader {
     downloadSettings: IReleaseDownloadSettings
   ): DownloadMetaData[] {
     const downloads: DownloadMetaData[] = []
+    const DIGEST_ROLLOUT_DATE = new Date('2025-07-01T00:00:00Z')
 
     if (downloadSettings.fileName.length > 0) {
       if (ghRelease && ghRelease.assets.length > 0) {
@@ -205,10 +224,19 @@ export class ReleaseDownloader {
             continue
           }
 
+          const verification = asset.digest ? this.parseDigest(asset.digest) : undefined
+          const assetUpdateDate = new Date(asset.updated_at)
+
+          // 2025 Rollout Logic: Warn if post-July 1st asset lacks digest
+          if (assetUpdateDate >= DIGEST_ROLLOUT_DATE && !verification) {
+            core.warning(`Asset '${asset.name}' updated after 2025-07-01 but missing digest.`)
+          }
+
           const dData: DownloadMetaData = {
             fileName: asset.name,
-            url: asset['url'],
-            isTarBallOrZipBall: false
+            url: asset.url,
+            isTarBallOrZipBall: false,
+            verification
           }
           downloads.push(dData)
         }
@@ -223,8 +251,9 @@ export class ReleaseDownloader {
       }
     }
 
+    const repoName = downloadSettings.sourceRepoPath.split('/')[1]
+    //const repoName = downloadSettings.sourceRepoPath.split('/').pop() || 'release'
     if (downloadSettings.tarBall) {
-      const repoName = downloadSettings.sourceRepoPath.split('/')[1]
       downloads.push({
         fileName: `${repoName}-${ghRelease.tag_name}.tar.gz`,
         url: ghRelease.tarball_url,
@@ -233,7 +262,6 @@ export class ReleaseDownloader {
     }
 
     if (downloadSettings.zipBall) {
-      const repoName = downloadSettings.sourceRepoPath.split('/')[1]
       downloads.push({
         fileName: `${repoName}-${ghRelease.tag_name}.zip`,
         url: ghRelease.zipball_url,
@@ -256,59 +284,115 @@ export class ReleaseDownloader {
     const outFileDir = path.resolve(out)
 
     if (!fs.existsSync(outFileDir)) {
-      io.mkdirP(outFileDir)
+      await io.mkdirP(outFileDir)
     }
 
-    const downloads: Promise<string>[] = []
+    // Hidden temp directory in destination directory for atomic cleanup
+    const tempDir = path.join(outFileDir, `.temp_${crypto.randomBytes(4).toString('hex')}`)
+    await io.mkdirP(tempDir)
 
-    for (const asset of dData) {
-      downloads.push(this.downloadFile(asset, out))
+    try {
+      const downloadedTempPaths: string[] = []
+      
+      for (const asset of dData) {
+        const tempFilePath = path.join(outFileDir, asset.fileName)
+        await this.downloadFile(asset, tempFilePath)
+        downloadedTempPaths.push(tempFilePath)
+      }
+
+      const finalPaths: string[] = []
+
+      for (const tempPath of downloadedTempPaths) {
+        const finalPath = path.join(outFileDir, path.basename(tempPath))
+        
+        if (fs.existsSync(finalPath)) {
+          const stats = fs.lstatSync(finalPath)
+          if (stats.isFile() || stats.isSymbolicLink()) {
+            await fs.promises.unlink(finalPath)
+          } else if (stats.isDirectory()) {
+            throw new Error(`Conflict: '${finalPath}' is a directory and cannot be overwritten.`)
+          }
+        }
+        
+        await fs.promises.rename(tempPath, finalPath)
+        finalPaths.push(finalPath)
+      }
+
+      // Cleanup ensures directory is strictly empty (sanity check)
+      try {
+        await fs.promises.rmdir(tempDir) 
+      } catch (err: unknown) {
+        let msg = `Cleanup Error: `
+        if (err instanceof Error && 'code' in err && (err as {code: string}).code === 'ENOTEMPTY') {
+          msg += `Temp directory '${tempDir}' was not empty.`
+        } else {
+          msg += err instanceof Error ? err.message : String(err)
+        }
+        throw new Error(msg)
+      }
+
+      return finalPaths
+
+    } catch (error: unknown) {
+      core.error(`Download/Verification failed. Purging temporary directory: ${tempDir}`)
+      await fs.promises.rm(tempDir, { recursive: true, force: true })
+      throw error instanceof Error ? error : new Error(String(error))
     }
-
-    const result = await Promise.all(downloads)
-    return result
   }
 
+  /**
+   * Downloads an individual file and verifies its digest if available
+   * @param asset Asset metadata
+   * @param tempPath Path to save the temporary file
+   */
   private async downloadFile(
     asset: DownloadMetaData,
-    outputPath: string
-  ): Promise<string> {
-    const headers: IHeaders = {
-      Accept: 'application/octet-stream'
-    }
-
-    if (asset.isTarBallOrZipBall) {
-      headers['Accept'] = '*/*'
+    tempPath: string
+  ): Promise<void> {
+    const headers: IHeaders = { 
+      Accept: asset.isTarBallOrZipBall ? '*/*' : 'application/octet-stream'
     }
 
     core.info(`Downloading file: ${asset.fileName} to: ${outputPath}`)
     const response = await this.httpClient.get(asset.url, headers)
 
-    if (response.message.statusCode === 200) {
-      return this.saveFile(outputPath, asset.fileName, response)
-    } else {
+    if (response.message.statusCode !== 200) {
       const err: Error = new Error(
-        `Unexpected response: ${response.message.statusCode}`
+        `Asset download failed: HTTP ${response.message.statusCode}`
       )
       throw err
+      //throw new Error(`Asset download failed: HTTP ${response.message.statusCode}`)
+    }
+
+    const fileStream = fs.createWriteStream(tempPath)
+    await new Promise<void>((resolve, reject) => {
+      fileStream.on('error', reject)
+      response.message.pipe(fileStream).on('close', resolve)
+    })
+
+    // Verification Logic: only run if GitHub provided a digest (2025 feature)
+    if (asset.verification) {
+      const { algorithm, expectedHash } = asset.verification
+      const actualHash = await this.calculateHash(tempPath, algorithm)
+      if (actualHash !== expectedHash) {
+        throw new Error(`Integrity check failed for ${asset.fileName}. Expected (${algorithm}): ${expectedHash}, Actual: ${actualHash}`)
+      }
+      core.info(`Verified integrity for ${asset.fileName}`)
     }
   }
 
-  private async saveFile(
-    outputPath: string,
-    fileName: string,
-    httpClientResponse: IHttpClientResponse
-  ): Promise<string> {
-    const outFilePath: string = path.resolve(outputPath, fileName)
-    const fileStream: fs.WriteStream = fs.createWriteStream(outFilePath)
-
+  /**
+   * Calculates the hash of a file
+   * @param filePath Path to the file
+   * @param algorithm Crypto algorithm to use
+   */
+  private async calculateHash(filePath: string, algorithm: string): Promise<string> {
+    const hash = crypto.createHash(algorithm)
+    const stream = fs.createReadStream(filePath)
     return new Promise((resolve, reject) => {
-      fileStream.on('error', err => reject(err))
-      const outStream = httpClientResponse.message.pipe(fileStream)
-
-      outStream.on('close', () => {
-        resolve(outFilePath)
-      })
+      stream.on('data', data => hash.update(data))
+      stream.on('end', () => resolve(hash.digest('hex')))
+      stream.on('error', reject)
     })
   }
 }
