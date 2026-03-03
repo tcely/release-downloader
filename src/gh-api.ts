@@ -1,6 +1,8 @@
 interface GhAsset {
   name: string
   url: string
+  updated_at: string
+  digest?: string
 }
 
 export interface GithubRelease {
@@ -17,4 +19,8 @@ export interface DownloadMetaData {
   fileName: string
   url: string
   isTarBallOrZipBall: boolean
+  verification?: {
+    algorithm: string
+    expectedHash: string
+  }
 }
