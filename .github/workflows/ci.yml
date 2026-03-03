@@ -80,6 +80,7 @@ jobs:
         run: ls -lrth prerelease-downloads
 
       - name: Test download from a private repo
+        if: github.ref_name == github.event.repository.default_branch
         uses: ./
         id: download-private
         with:
@@ -93,6 +94,7 @@ jobs:
           out-file-path: './downloader-test'
 
       - name: List downloaded files from private repo
+        if: github.ref_name == github.event.repository.default_branch
         shell: bash
         run: ls -lrth downloader-test
 
@@ -104,9 +106,11 @@ jobs:
           else echo "Unable to read output variable from step download-public"; exit 1
           fi
 
+          if [ '${{ github.ref_name }}' = '${{ github.event.repository.default_branch }}' ]; then
           if [ -n ${{steps.download-private.outputs.tag_name}} ]; then
             echo ${{steps.download-private.outputs.tag_name}}
           else echo "Unable to read output variable from step download-private"; exit 1
+          fi
           fi
 
           echo "Downloaded files:"
