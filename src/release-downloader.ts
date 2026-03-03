@@ -251,8 +251,7 @@ export class ReleaseDownloader {
       }
     }
 
-    const repoName = downloadSettings.sourceRepoPath.split('/')[1]
-    //const repoName = downloadSettings.sourceRepoPath.split('/').pop() || 'release'
+    const repoName = downloadSettings.sourceRepoPath.split('/').pop()
     if (downloadSettings.tarBall) {
       downloads.push({
         fileName: `${repoName}-${ghRelease.tag_name}.tar.gz`,
@@ -295,7 +294,7 @@ export class ReleaseDownloader {
       const downloadedTempPaths: string[] = []
       
       for (const asset of dData) {
-        const tempFilePath = path.join(outFileDir, asset.fileName)
+        const tempFilePath = path.join(tempDir, asset.fileName)
         await this.downloadFile(asset, tempFilePath)
         downloadedTempPaths.push(tempFilePath)
       }
@@ -353,7 +352,7 @@ export class ReleaseDownloader {
       Accept: asset.isTarBallOrZipBall ? '*/*' : 'application/octet-stream'
     }
 
-    core.info(`Downloading file: ${asset.fileName} to: ${outputPath}`)
+    core.info(`Downloading file: ${asset.fileName} to: ${tempPath}`)
     const response = await this.httpClient.get(asset.url, headers)
 
     if (response.message.statusCode !== 200) {
@@ -361,7 +360,6 @@ export class ReleaseDownloader {
         `Asset download failed: HTTP ${response.message.statusCode}`
       )
       throw err
-      //throw new Error(`Asset download failed: HTTP ${response.message.statusCode}`)
     }
 
     const fileStream = fs.createWriteStream(tempPath)
